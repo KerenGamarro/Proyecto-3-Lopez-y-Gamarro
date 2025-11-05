@@ -1,0 +1,149 @@
+/**
+ * ============================================================================
+ * ESP32 - Esclavo I2C para comunicación con STM32
+ * ============================================================================
+ * 
+ * Conexiones:
+ * - GPIO21 (SDA) → STM32 PB9 (SDA)
+ * - GPIO22 (SCL) → STM32 PB8 (SCL)
+ * - GND común entre ambas placas
+ * - Resistencias pull-up 4.7kΩ en SDA y SCL a 3.3V
+ * 
+ * Protocolo:
+ * - Comando 0x00: Apagar LED
+ * - Comando 0x01: Encender LED
+ * ============================================================================
+ */
+
+#include <Arduino.h>
+#include <Wire.h>
+
+/* ========== DEFINICIONES ========== */
+#define LED_PIN 2              // LED integrado del ESP32
+#define I2C_SLAVE_ADDR 0x08    // Dirección I2C del ESP32 (7 bits)
+
+/* ========== VARIABLES GLOBALES ========== */
+uint8_t receivedData = 0;      // Dato recibido del maestro
+volatile bool newDataReceived = false;  // Bandera de dato nuevo
+
+/* ========== PROTOTIPO DE FUNCIONES ========== */
+void onReceive(int numBytes);
+void onRequest();
+
+/* ============================================================================ */
+/* CONFIGURACIÓN INICIAL                                                        */
+/* ============================================================================ */
+void setup() {
+  /* ========== INICIALIZACIÓN SERIAL ========== */
+  Serial.begin(115200);
+  delay(2000);
+  Serial.println("\n\n=================================");
+  Serial.println("ESP32 - Esclavo I2C Iniciado");
+  Serial.print("Dirección I2C: 0x");
+  Serial.println(I2C_SLAVE_ADDR, HEX);
+  Serial.println("Pines: SDA=GPIO21, SCL=GPIO22");
+  Serial.println("=================================\n");
+
+  /* ========== CONFIGURACIÓN DEL LED ========== */
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);  // LED apagado inicialmente
+  Serial.println("LED configurado en GPIO2");
+
+  /* ========== CONFIGURACIÓN I2C ========== */
+  // Registra las funciones callback ANTES de inicializar I2C
+  Wire.onReceive(onReceive);  // Llamada cuando el maestro envía datos
+  Wire.onRequest(onRequest);  // Llamada cuando el maestro solicita datos
+  
+  // Inicializa I2C como esclavo (usa pines por defecto GPIO21=SDA, GPIO22=SCL)
+  Wire.begin((uint8_t)I2C_SLAVE_ADDR);
+  
+  Serial.println("I2C inicializado como esclavo");
+  Serial.println("Esperando comandos del maestro...\n");
+  
+  // Parpadeo rápido del LED para indicar que está listo
+  for(int i = 0; i < 3; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(100);
+    digitalWrite(LED_PIN, LOW);
+    delay(100);
+  }
+}
+
+/* ============================================================================ */
+/* LOOP PRINCIPAL                                                               */
+/* ============================================================================ */
+void loop() {
+  /* ========== PROCESAMIENTO DE DATOS RECIBIDOS ========== */
+  // Solo procesa si hay un dato nuevo disponible
+  if (newDataReceived) {
+    newDataReceived = false;  // Limpia la bandera
+    
+    /* Muestra el dato recibido por serial */
+    Serial.print(">>> Comando recibido: 0x");
+    if(receivedData < 0x10) Serial.print("0");  // Para mostrar siempre 2 dígitos
+    Serial.print(receivedData, HEX);
+    Serial.print(" (");
+    Serial.print(receivedData, DEC);
+    Serial.print(") ");
+    
+    /* ========== CONTROL DEL LED SEGÚN COMANDO ========== */
+    if (receivedData == 0x01 || receivedData == 1) {
+      // Comando 0x01: Encender LED
+      digitalWrite(LED_PIN, HIGH);
+      Serial.println("→ LED ENCENDIDO ✓");
+    } 
+    else if (receivedData == 0x00 || receivedData == 0) {
+      // Comando 0x00: Apagar LED
+      digitalWrite(LED_PIN, LOW);
+      Serial.println("→ LED APAGADO ✓");
+    }
+    else {
+      // Comando desconocido
+      Serial.println("→ Comando no reconocido ✗");
+    }
+  }
+  
+  /* Pequeña pausa para no saturar el procesador */
+  delay(10);
+}
+
+/* ============================================================================ */
+/* CALLBACK: DATOS RECIBIDOS DEL MAESTRO                                        */
+/* ============================================================================ */
+/**
+ * @brief  Función llamada automáticamente cuando el maestro envía datos
+ * @param  numBytes: Número de bytes recibidos
+ * @note   Esta función se ejecuta en contexto de interrupción
+ */
+void onReceive(int numBytes) {
+  Serial.print("\n[I2C] Transacción iniciada - Bytes: ");
+  Serial.println(numBytes);
+  
+  /* Lee todos los bytes disponibles en el buffer */
+  while (Wire.available()) {
+    receivedData = Wire.read();  // Lee un byte
+    Serial.print("    Byte leído: 0x");
+    if(receivedData < 0x10) Serial.print("0");
+    Serial.println(receivedData, HEX);
+  }
+  
+  /* Activa la bandera para procesar el dato en el loop principal */
+  newDataReceived = true;
+}
+
+/* ============================================================================ */
+/* CALLBACK: MAESTRO SOLICITA DATOS                                             */
+/* ============================================================================ */
+/**
+ * @brief  Función llamada cuando el maestro solicita datos del esclavo
+ * @note   Esta función se ejecuta en contexto de interrupción
+ *         Aquí el esclavo puede enviar datos de vuelta al maestro
+ */
+void onRequest() {
+  /* Envía el estado actual del LED al maestro */
+  uint8_t ledStatus = digitalRead(LED_PIN);
+  Wire.write(ledStatus);
+  
+  Serial.print("\n[I2C] Maestro solicita datos - Enviando LED status: ");
+  Serial.println(ledStatus);
+}
