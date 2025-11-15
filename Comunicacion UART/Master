@@ -56,27 +56,14 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-      static uint32_t last = 0;
+	  uint8_t tx = 'A';
+	  HAL_UART_Transmit(&huart3, &tx, 1, 10);
+	  HAL_Delay(100);
+	  uint8_t rx;
+	  if (HAL_UART_Receive(&huart3, &rx, 1, 10) == HAL_OK) {
+	      // Opcional: parpadear un LED
+	  }
 
-      if (HAL_GetTick() - last >= 1000)
-      {
-          last = HAL_GetTick();
-
-          char msgESP[50];
-          sprintf(msgESP, "PING_STM32_%lu\r\n", HAL_GetTick()/1000);
-
-          HAL_StatusTypeDef st = HAL_UART_Transmit(&huart3, (uint8_t*)msgESP, strlen(msgESP), 200);
-
-          HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_7);  // LED PC7
-
-          if (st == HAL_OK)
-              HAL_UART_Transmit(&huart2, (uint8_t*)"TX UART3 OK\r\n", 13, 200);
-          else {
-              char err[40];
-              sprintf(err, "TX UART3 ERROR %d\r\n", st);
-              HAL_UART_Transmit(&huart2, (uint8_t*)err, strlen(err), 200);
-          }
-      }
   }
   /* USER CODE END WHILE */
 }
