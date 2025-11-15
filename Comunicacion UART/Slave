@@ -1,0 +1,31 @@
+#include <Arduino.h>
+
+#define LED 2   // LED del ESP32
+#define RXD2 16
+#define TXD2 17
+
+
+void setup() {
+  Serial.begin(115200);                  // Monitor Serial
+  Serial2.begin(115200, SERIAL_8N1, RXD2, TXD2);
+
+  pinMode(LED, OUTPUT);
+  digitalWrite(LED, LOW);
+
+  Serial.println("ESP32 listo. Esperando mensajes...");
+}
+
+void loop() {
+
+  if (Serial2.available()) {
+
+    String msg = Serial2.readStringUntil('\n');
+
+    Serial.print("RX STM32: ");
+    Serial.println(msg);
+
+    digitalWrite(LED, HIGH);
+    delay(50);
+    digitalWrite(LED, LOW);
+  }
+}
