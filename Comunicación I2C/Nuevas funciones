@@ -1,0 +1,347 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : STM32 Master I2C 
+  * @description    :
+  *   Comunicación I2C entre STM32 (maestro) y ESP32 (esclavo).
+  *   - Al presionar el botón USER (PC13) en la NUCLEO:
+  *       -> Se hace toggle de un byte (0 / 1).
+  *       -> Se envía ese byte por I2C a la dirección 0x08 (ESP32).
+  *       -> Se actualiza el LED local (PC7) como espejo del comando enviado.
+  *
+  * Conexiones I2C:
+  *   - PB8 (I2C1_SCL) → ESP32 GPIO22 (SCL)
+  *   - PB9 (I2C1_SDA) → ESP32 GPIO21 (SDA)
+  *   - GND común
+  *
+  * IMPORTANTE:
+  *   - Pull-ups de 4.7kΩ a 3.3V en SDA y SCL.
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+#include "main.h"
+#include "string.h"
+#include "stdio.h"
+
+/* Private variables ---------------------------------------------------------*/
+I2C_HandleTypeDef hi2c1;       // I2C1: maestro hacia ESP32
+SPI_HandleTypeDef hspi1;       // SPI1
+UART_HandleTypeDef huart2;     // USART2: debug por ST-LINK
+UART_HandleTypeDef huart3;     // USART3: libre para extender
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_I2C1_Init(void);
+static void MX_SPI1_Init(void);
+static void MX_USART2_UART_Init(void);
+static void MX_USART3_UART_Init(void);
+
+/* USER CODE BEGIN PV */
+#define ESP32_I2C_ADDRESS  0x08   // Dirección I2C del ESP32 (7 bits)
+#define I2C_TIMEOUT        100    // Timeout I2C en ms
+
+uint8_t ledState        = 0;     // Estado actual enviado al ESP32 (0 = OFF, 1 = ON)
+uint8_t btnLastState    = 0;     // Estado previo del botón (para flanco)
+uint8_t btnCurrentState = 0;     // Estado actual del botón
+/* USER CODE END PV */
+
+int main(void)
+{
+  /* Inicialización de HAL */
+  HAL_Init();
+
+  /* Configuración del reloj del sistema (180 MHz, HSI + PLL) */
+  SystemClock_Config();
+
+  /* Inicialización de periféricos */
+  MX_GPIO_Init();          // LED PC7, botón PC13, PB6 como salida genérica
+  MX_I2C1_Init();          // I2C1 maestro a 100 kHz
+  MX_SPI1_Init();          // SPI1 maestro 
+  MX_USART2_UART_Init();   // UART2 para debug
+  MX_USART3_UART_Init();   // UART3 disponible
+
+  /* Mensajes iniciales por UART2 */
+  HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n=================================\r\n", 37, HAL_MAX_DELAY);
+  HAL_UART_Transmit(&huart2, (uint8_t*)"STM32 I2C Master Ready\r\n", 24, HAL_MAX_DELAY);
+  HAL_UART_Transmit(&huart2, (uint8_t*)"Direccion ESP32 (7 bits): 0x08\r\n", 32, HAL_MAX_DELAY);
+  HAL_UART_Transmit(&huart2, (uint8_t*)"=================================\r\n\r\n", 37, HAL_MAX_DELAY);
+
+  HAL_Delay(100);  // Pausa breve para estabilizar
+
+  /* Bucle principal */
+  while (1)
+  {
+    /* Lectura del botón USER (PC13) */
+    btnCurrentState = HAL_GPIO_ReadPin(BTN_GPIO_Port, BTN_Pin);
+
+    /* Detección de flanco de subida: 0 -> 1 */
+    if (btnCurrentState == GPIO_PIN_SET && btnLastState == GPIO_PIN_RESET)
+    {
+      /* Antirrebote básico */
+      HAL_Delay(50);
+      if (HAL_GPIO_ReadPin(BTN_GPIO_Port, BTN_Pin) == GPIO_PIN_SET)
+      {
+        /* Toggle de estado del LED que se envía al ESP32 */
+        ledState = !ledState;
+
+        /* Transmisión I2C: se envía un solo byte (0 o 1) */
+        HAL_StatusTypeDef i2c_status;
+        uint8_t txByte = ledState;
+
+        i2c_status = HAL_I2C_Master_Transmit(&hi2c1,
+                                             (ESP32_I2C_ADDRESS << 1), // Dirección 7 bits desplazada
+                                             &txByte,
+                                             1,
+                                             I2C_TIMEOUT);
+
+        /* Gestión del resultado de la transmisión */
+        if (i2c_status == HAL_OK)
+        {
+          char msg[64];
+          snprintf(msg, sizeof(msg),
+                   "I2C OK - Comando enviado: %d\r\n", (int)ledState);
+          HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+
+          /* Reflejar estado en LED local (PC7) */
+          HAL_GPIO_WritePin(LED_GPIO_Port,
+                            LED_Pin,
+                            ledState ? GPIO_PIN_SET : GPIO_PIN_RESET);
+        }
+        else if (i2c_status == HAL_TIMEOUT)
+        {
+          HAL_UART_Transmit(&huart2,
+                            (uint8_t*)"ERROR I2C: Timeout (ESP32 no responde)\r\n",
+                            40,
+                            HAL_MAX_DELAY);
+        }
+        else
+        {
+          HAL_UART_Transmit(&huart2,
+                            (uint8_t*)"ERROR I2C: Fallo de comunicacion (NACK/bus)\r\n",
+                            47,
+                            HAL_MAX_DELAY);
+        }
+
+        HAL_Delay(10); // Pausa corta tras la transacción
+      }
+    }
+
+    /* Actualizar estado previo del botón */
+    btnLastState = btnCurrentState;
+
+    /* Pequeña pausa para no saturar CPU */
+    HAL_Delay(10);
+  }
+}
+
+/* ============================================================================ */
+/* CONFIGURACIÓN DEL RELOJ DEL SISTEMA (180 MHz, HSI + PLL)                     */
+/* ============================================================================ */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /* 1) Habilitar reloj de PWR y configurar escala de voltaje */
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
+
+  /* 2) Configurar HSI + PLL para 180 MHz */
+  RCC_OscInitStruct.OscillatorType      = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState            = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState        = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource       = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLM            = 8;                 // 16 / 8 = 2 MHz
+  RCC_OscInitStruct.PLL.PLLN            = 180;               // 2 * 180 = 360 MHz VCO
+  RCC_OscInitStruct.PLL.PLLP            = RCC_PLLP_DIV2;     // 360 / 2 = 180 MHz SYSCLK
+  RCC_OscInitStruct.PLL.PLLQ            = 4;                 // valor típico seguro para USB, etc.
+  // PLLR en muchos F4 no se usa, puede quedar por defecto
+
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /* 3) Activar OverDrive para permitir 180 MHz */
+  if (HAL_PWREx_EnableOverDrive() != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /* 4) Configurar divisores de bus:
+   *    AHB  = 180 MHz
+   *    APB1 = 45 MHz (DIV4)
+   *    APB2 = 90 MHz (DIV2)
+   */
+  RCC_ClkInitStruct.ClockType      = RCC_CLOCKTYPE_HCLK   |
+                                     RCC_CLOCKTYPE_SYSCLK |
+                                     RCC_CLOCKTYPE_PCLK1  |
+                                     RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource   = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider  = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/* ============================================================================ */
+/* INICIALIZACIÓN DE I2C1                                                       */
+/* ============================================================================ */
+static void MX_I2C1_Init(void)
+{
+  hi2c1.Instance             = I2C1;
+  hi2c1.Init.ClockSpeed      = 100000;                   // 100 kHz
+  hi2c1.Init.DutyCycle       = I2C_DUTYCYCLE_2;
+  hi2c1.Init.OwnAddress1     = 0;                        // maestro
+  hi2c1.Init.AddressingMode  = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2     = 0;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode   = I2C_NOSTRETCH_DISABLE;
+
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /* Filtro analógico ON y filtro digital OFF (0) para robustez */
+  if (HAL_I2CEx_ConfigAnalogFilter(&hi2c1, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_I2CEx_ConfigDigitalFilter(&hi2c1, 0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/* ============================================================================ */
+/* INICIALIZACIÓN DE SPI1                                                       */
+/* ============================================================================ */
+static void MX_SPI1_Init(void)
+{
+  hspi1.Instance               = SPI1;
+  hspi1.Init.Mode              = SPI_MODE_MASTER;
+  hspi1.Init.Direction         = SPI_DIRECTION_2LINES;
+  hspi1.Init.DataSize          = SPI_DATASIZE_8BIT;
+  hspi1.Init.CLKPolarity       = SPI_POLARITY_LOW;
+  hspi1.Init.CLKPhase          = SPI_PHASE_1EDGE;
+  hspi1.Init.NSS               = SPI_NSS_SOFT;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
+  hspi1.Init.FirstBit          = SPI_FIRSTBIT_MSB;
+  hspi1.Init.TIMode            = SPI_TIMODE_DISABLE;
+  hspi1.Init.CRCCalculation    = SPI_CRCCALCULATION_DISABLE;
+  hspi1.Init.CRCPolynomial     = 10;
+
+  if (HAL_SPI_Init(&hspi1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/* ============================================================================ */
+/* INICIALIZACIÓN DE USART2 (DEBUG)                                             */
+/* ============================================================================ */
+static void MX_USART2_UART_Init(void)
+{
+  huart2.Instance          = USART2;
+  huart2.Init.BaudRate     = 115200;
+  huart2.Init.WordLength   = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits     = UART_STOPBITS_1;
+  huart2.Init.Parity       = UART_PARITY_NONE;
+  huart2.Init.Mode         = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl    = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/* ============================================================================ */
+/* INICIALIZACIÓN DE USART3                                                     */
+/* ============================================================================ */
+static void MX_USART3_UART_Init(void)
+{
+  huart3.Instance          = USART3;
+  huart3.Init.BaudRate     = 115200;
+  huart3.Init.WordLength   = UART_WORDLENGTH_8B;
+  huart3.Init.StopBits     = UART_STOPBITS_1;
+  huart3.Init.Parity       = UART_PARITY_NONE;
+  huart3.Init.Mode         = UART_MODE_TX_RX;
+  huart3.Init.HwFlowCtl    = UART_HWCONTROL_NONE;
+  huart3.Init.OverSampling = UART_OVERSAMPLING_16;
+
+  if (HAL_UART_Init(&huart3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/* ============================================================================ */
+/* INICIALIZACIÓN DE GPIO                                                       */
+/* ============================================================================ */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  /* Habilitar relojes de puertos */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOH_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /* LED local (PC7) apagado al inicio */
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7, GPIO_PIN_RESET);
+
+  /* PB6 en bajo (por ejemplo CS de SPI1) */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET);
+
+  /* Botón USER (PC13) como entrada */
+  GPIO_InitStruct.Pin  = GPIO_PIN_13;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;   // La placa NUCLEO ya lleva pull-down
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /* LED (PC7) como salida */
+  GPIO_InitStruct.Pin   = GPIO_PIN_7;
+  GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull  = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /* PB6 como salida (CS u otra señal) */
+  GPIO_InitStruct.Pin   = GPIO_PIN_6;
+  GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull  = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+}
+
+/* ============================================================================ */
+/* MANEJADOR DE ERRORES                                                         */
+/* ============================================================================ */
+void Error_Handler(void)
+{
+  __disable_irq();
+  while (1)
+  {
+    // Opcional: parpadeo en LED para indicar error
+  }
+}
+
+#ifdef  USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* Puedes imprimir por UART si deseas trazar asserts */
+}
+#endif /* USE_FULL_ASSERT */
