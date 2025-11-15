@@ -1,0 +1,53 @@
+#include <Arduino.h>
+#include <Adafruit_NeoPixel.h>
+
+#define NEOPIXEL_PIN 23
+#define NUM_PIXELS 1
+
+// UART2 to Nucleo: RX=16, TX=17
+HardwareSerial SerialNucleo(2);
+
+Adafruit_NeoPixel pixel(NUM_PIXELS, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
+
+void setColor(uint8_t r, uint8_t g, uint8_t b) {
+  pixel.setPixelColor(0, pixel.Color(r, g, b));
+  pixel.show();
+}
+
+void setup() {
+  Serial.begin(115200);
+  SerialNucleo.begin(115200, SERIAL_8N1, 16, 17); // RX, TX
+
+  pixel.begin();
+  pixel.clear();
+  setColor(0, 150, 0); // Verde inicial
+  Serial.println("ESP32 slave listo");
+}
+
+void loop() {
+  if (SerialNucleo.available()) {
+    char c = SerialNucleo.read();
+    Serial.print("CMD desde STM32: ");
+    Serial.println(c);
+
+    if (c == 'M') {
+      // MEDICION: azul, simular valor y responder por UART
+      setColor(0, 0, 150);
+      delay(200); // simula toma de muestra
+      int valor = random(50, 100); // valor simulado
+      // enviar valor seguido de newline
+      SerialNucleo.print(valor);
+      SerialNucleo.print("\n");
+      // volver a verde
+      setColor(0, 150, 0);
+    }
+    else if (c == 'G') {
+      // GUARDAR: magenta, simular guardado y responder
+      setColor(150, 0, 150);
+      delay(150);
+      SerialNucleo.print("OK\n");
+      setColor(0, 150, 0);
+    }
+    // ignorar otros caracteres
+  }
+}
