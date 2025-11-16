@@ -1,0 +1,268 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_TSL2561_U.h>
+#include <Adafruit_NeoPixel.h>
+
+/* ================== CONFIGURACIÓN ================== */
+// NeoPixel
+#define PIN_NEOPIXEL 23
+#define NUM_PIXELS 1
+
+// UART2 hacia STM32
+#define UART2_RX_PIN 32  // En lugar de 16
+#define UART2_TX_PIN 33  // En lugar de 17
+#define UART2_BAUD 115200
+
+// I2C para el sensor TSL2561
+#define I2C_SDA 25
+#define I2C_SCL 26
+
+// LED integrado
+#define LED_PIN 2
+
+/* ================== OBJETOS GLOBALES ================== */
+Adafruit_NeoPixel pixels(NUM_PIXELS, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
+Adafruit_TSL2561_Unified tsl = Adafruit_TSL2561_Unified(TSL2561_ADDR_FLOAT, 12345);
+
+/* ================== VARIABLES ================== */
+float lastLux = 0;
+bool sensorOK = false;
+
+/* ================== FUNCIONES ================== */
+
+/**
+ * @brief Inicializa el sensor TSL2561
+ */
+void initSensor() {
+  Serial.println("\n[SENSOR] Inicializando TSL2561...");
+  
+  if (!tsl.begin()) {
+    Serial.println("[ERROR] No se detecta el sensor TSL2561!");
+    Serial.println("Verifica las conexiones:");
+    Serial.println("  SDA -> GPIO25");
+    Serial.println("  SCL -> GPIO26");
+    sensorOK = false;
+    
+    // LED ROJO para error
+    pixels.setPixelColor(0, pixels.Color(100, 0, 0));
+    pixels.show();
+    delay(2000);
+    pixels.clear();
+    pixels.show();
+    return;
+  }
+  
+  sensorOK = true;
+  Serial.println("[OK] Sensor TSL2561 detectado!");
+  
+  // Configurar ganancia y tiempo de integración
+  tsl.enableAutoRange(true);  // Auto-ganancia
+  tsl.setIntegrationTime(TSL2561_INTEGRATIONTIME_13MS);
+  
+  sensor_t sensor;
+  tsl.getSensor(&sensor);
+  Serial.println("------------------------------------");
+  Serial.print("Sensor:       "); Serial.println(sensor.name);
+  Serial.print("Driver Ver:   "); Serial.println(sensor.version);
+  Serial.print("Unique ID:    "); Serial.println(sensor.sensor_id);
+  Serial.print("Max Value:    "); Serial.print(sensor.max_value); Serial.println(" lux");
+  Serial.print("Min Value:    "); Serial.print(sensor.min_value); Serial.println(" lux");
+  Serial.print("Resolution:   "); Serial.print(sensor.resolution); Serial.println(" lux");
+  Serial.println("------------------------------------\n");
+  
+  // LED VERDE para éxito
+  pixels.setPixelColor(0, pixels.Color(0, 100, 0));
+  pixels.show();
+  delay(500);
+  pixels.clear();
+  pixels.show();
+}
+
+/**
+ * @brief Lee el valor del sensor
+ * @return String con el valor en lux
+ */
+String leerSensor() {
+  if (!sensorOK) {
+    return "ERROR_SENSOR_NO_INIT";
+  }
+  
+  sensors_event_t event;
+  tsl.getEvent(&event);
+  
+  if (event.light) {
+    lastLux = event.light;
+    
+    String resultado = "LUX:";
+    resultado += String(lastLux, 2);
+    resultado += ":OK";
+    
+    return resultado;
+  } else {
+    return "ERROR_SENSOR_OVERFLOW";
+  }
+}
+
+/**
+ * @brief Enciende el NeoPixel con color y duración
+ */
+void setNeoPixel(uint8_t r, uint8_t g, uint8_t b, int duracion = 0) {
+  pixels.setPixelColor(0, pixels.Color(r, g, b));
+  pixels.show();
+  if (duracion > 0) {
+    delay(duracion);
+    pixels.clear();
+    pixels.show();
+  }
+}
+
+/* ================== SETUP ================== */
+void setup() {
+  // Serial para debug (USB)
+  Serial.begin(115200);
+  delay(2000);
+  
+  Serial.println("\n\n========================================");
+  Serial.println("     ESP32 - PROYECTO 3");
+  Serial.println("   Sensor TSL2561 + UART + NeoPixel");
+  Serial.println("========================================");
+  
+  // LED integrado
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  
+  // NeoPixel
+  Serial.println("[INIT] Inicializando NeoPixel...");
+  pixels.begin();
+  pixels.setBrightness(50);
+  pixels.clear();
+  pixels.show();
+  
+  // Test NeoPixel (RGB)
+  setNeoPixel(100, 0, 0, 200);    // Rojo
+  setNeoPixel(0, 100, 0, 200);    // Verde
+  setNeoPixel(0, 0, 100, 200);    // Azul
+  Serial.println("[OK] NeoPixel funcionando");
+  
+  // I2C para el sensor
+  Serial.println("\n[INIT] Inicializando I2C...");
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Serial.print("  SDA: GPIO");
+  Serial.println(I2C_SDA);
+  Serial.print("  SCL: GPIO");
+  Serial.println(I2C_SCL);
+  
+  // Inicializar sensor
+  initSensor();
+  
+  // UART2 para comunicación con STM32
+  Serial.println("\n[INIT] Inicializando UART2...");
+  Serial2.begin(UART2_BAUD, SERIAL_8N1, UART2_RX_PIN, UART2_TX_PIN);
+  Serial.print("  RX: GPIO");
+  Serial.println(UART2_RX_PIN);
+  Serial.print("  TX: GPIO");
+  Serial.println(UART2_TX_PIN);
+  Serial.print("  Baud: ");
+  Serial.println(UART2_BAUD);
+  
+  Serial.println("\n========================================");
+  Serial.println("Sistema listo!");
+  Serial.println("Esperando comandos UART del STM32...");
+  Serial.println("========================================\n");
+  
+  // NeoPixel AZUL = sistema listo
+  setNeoPixel(0, 0, 100, 500);
+  
+  delay(500);
+}
+
+/* ================== LOOP ================== */
+unsigned long lastHeartbeat = 0;
+unsigned long lastAutoRead = 0;
+int commandCounter = 0;
+
+void loop() {
+  
+  // Heartbeat cada 5 segundos
+  if (millis() - lastHeartbeat > 5000) {
+    lastHeartbeat = millis();
+    Serial.println("[HEARTBEAT] ESP32 activo, esperando comandos...");
+  }
+  
+  // Lectura automática cada 10 segundos (opcional, para debug)
+  if (millis() - lastAutoRead > 10000) {
+    lastAutoRead = millis();
+    String lectura = leerSensor();
+    Serial.print("[AUTO] Lectura sensor: ");
+    Serial.println(lectura);
+  }
+  
+  // Verificar comandos UART desde STM32
+  if (Serial2.available()) {
+    String comando = Serial2.readStringUntil('\n');
+    comando.trim();
+    
+    if (comando.length() > 0) {
+      commandCounter++;
+      
+      Serial.println("\n========================================");
+      Serial.print("[CMD #");
+      Serial.print(commandCounter);
+      Serial.println("] Comando recibido del STM32");
+      Serial.print("Comando: [");
+      Serial.print(comando);
+      Serial.println("]");
+      
+      // NeoPixel AMARILLO = procesando comando
+      setNeoPixel(100, 100, 0);
+      digitalWrite(LED_PIN, HIGH);
+      
+      // Procesar comando
+      if (comando.indexOf("SOLICITUD") >= 0 || 
+          comando.indexOf("SENSOR") >= 0 ||
+          comando.indexOf("READ") >= 0) {
+        
+        Serial.println("[ACCION] Leyendo sensor TSL2561...");
+        
+        delay(100); // Simula tiempo de lectura
+        
+        String valor = leerSensor();
+        
+        Serial.print("[RESPUESTA] Valor: ");
+        Serial.println(valor);
+        
+        // Enviar respuesta al STM32
+        Serial2.println(valor);
+        
+        Serial.println("[TX] Dato enviado al STM32");
+        
+        // NeoPixel VERDE = éxito
+        setNeoPixel(0, 100, 0, 500);
+        
+      } else if (comando.indexOf("PING") >= 0) {
+        Serial.println("[ACCION] PING recibido");
+        Serial2.println("PONG");
+        Serial.println("[TX] PONG enviado");
+        setNeoPixel(0, 100, 100, 300); // Cian
+        
+      } else if (comando.indexOf("STATUS") >= 0) {
+        Serial.println("[ACCION] STATUS solicitado");
+        String status = sensorOK ? "SENSOR_OK" : "SENSOR_ERROR";
+        Serial2.println(status);
+        Serial.println("[TX] Status enviado");
+        setNeoPixel(0, 100, 100, 300); // Cian
+        
+      } else {
+        Serial.println("[WARNING] Comando no reconocido");
+        Serial2.println("ERROR_CMD_UNKNOWN");
+        setNeoPixel(100, 50, 0, 500); // Naranja
+      }
+      
+      digitalWrite(LED_PIN, LOW);
+      Serial.println("========================================\n");
+    }
+  }
+  
+  delay(10);
+}
