@@ -1,0 +1,637 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file    main.c
+  * @brief   STM32F446RE con ILI9341 - Fondo con dibujo + área de texto
+  *
+  * CORRECCIONES:
+  * 1. Panel reposicionado al área blanca derecha de la imagen
+  * 2. No se redibuja el fondo en cada actualización
+  * 3. Verificación de tamaño del bitmap
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include "fatfs.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include <string.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include "ili9341.h"
+#include "bitmaps.h"
+#include "fatfs_sd.h"
+/* USER CODE END Includes */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+/* Dimensiones de la pantalla ILI9341 */
+#define LCD_W  240
+#define LCD_H  320
+
+/* Dimensiones del bitmap de fondo */
+#define FONDO_W 240
+#define FONDO_H 320
+
+/* NUEVO: Panel posicionado en el área BLANCA DERECHA de tu imagen
+ * Ajusta estos valores según tu imagen:
+ * - Si el dibujo ocupa ~120px de ancho, el panel empieza en X=125
+ * - Centrado verticalmente
+ */
+#define PANEL_W   110    /* Ancho del panel de texto */
+#define PANEL_H   80     /* Alto del panel */
+#define PANEL_X   320    /* Posición X (área blanca derecha) */
+#define PANEL_Y   125    /* Posición Y (centrado verticalmente) */
+
+/* Colores RGB565 */
+#define COL_FG     0x0000   /* Negro para texto */
+#define COL_PANEL  0xFFFF   /* Fondo del panel (blanco) */
+#define COL_FRAME  0x0000   /* Borde del panel (negro) */
+
+/* USER CODE END PD */
+
+/* Private variables ---------------------------------------------------------*/
+SPI_HandleTypeDef hspi1;
+TIM_HandleTypeDef htim11;
+UART_HandleTypeDef huart2;
+UART_HandleTypeDef huart3;
+
+/* USER CODE BEGIN PV */
+
+/* Bitmap de fondo (debe ser 240x320x2 = 153,600 bytes) */
+extern const uint8_t BITMAP_ALIGN fondo[];
+
+/* Buffer de recepción UART */
+uint8_t rxBuffer[200];
+
+/* Flags de botones */
+uint8_t btnPressed     = 0;
+uint8_t btnSavePressed = 0;
+
+/* Último dato válido del sensor */
+static char   lastSensorStr[200] = {0};
+static bool   lastSensorValid    = false;
+
+/* SD / FatFs */
+static uint8_t sd_mounted = 0;
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_SPI1_Init(void);
+static void MX_USART2_UART_Init(void);
+static void MX_TIM11_Init(void);
+static void MX_USART3_UART_Init(void);
+
+/* USER CODE BEGIN PFP */
+static void UI_DrawBackground(void);
+static void UI_DrawSensorPanel(const char *text);
+static void UI_ClearPanel(void);
+static void SD_Init(void);
+static void SD_AppendLine(const char *line);
+static void ParseSensorString(const char *src, char *dst, size_t dstSize);
+/* USER CODE END PFP */
+
+/* USER CODE BEGIN 0 */
+
+/* Parsea "LUX:123.45:OK" -> "LUX:123.45" */
+static void ParseSensorString(const char *src, char *dst, size_t dstSize)
+{
+    if (!src || !dst || dstSize == 0) return;
+
+    char tmp[200];
+    strncpy(tmp, src, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = '\0';
+
+    char *token1 = strtok(tmp, ":");  // "LUX"
+    char *token2 = strtok(NULL, ":");  // "123.45"
+
+    if (token1 && token2) {
+        snprintf(dst, dstSize, "%s:%s", token1, token2);
+    } else {
+        strncpy(dst, src, dstSize - 1);
+        dst[dstSize - 1] = '\0';
+    }
+}
+
+/* Dibuja el fondo COMPLETO desde el bitmap en memoria
+ * SOLO SE LLAMA UNA VEZ en el setup
+ */
+static void UI_DrawBackground(void)
+{
+    char msg[100];
+
+    /* VERIFICACIÓN: El bitmap debe tener exactamente 153,600 bytes
+     * Si bitmaps.c define: const uint8_t BITMAP_ALIGN fondo[153600] = {...}
+     */
+    sprintf(msg, "[LCD] Dibujando fondo %dx%d desde memoria...\r\n", FONDO_W, FONDO_H);
+    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 1000);
+
+    LCD_Bitmap(0, 0, FONDO_W, FONDO_H, (unsigned char*)fondo);
+
+    sprintf(msg, "[LCD] Fondo cargado.\r\n");
+    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 1000);
+}
+
+/* Limpia SOLO el área del panel (útil antes de redibujar) */
+static void UI_ClearPanel(void)
+{
+    FillRect(PANEL_X, PANEL_Y, PANEL_W, PANEL_H, COL_PANEL);
+}
+
+/* Muestra el texto del sensor EN EL ÁREA BLANCA DERECHA
+ * Sin tocar el resto de la pantalla
+ */
+static void UI_DrawSensorPanel(const char *text)
+{
+    if (!text || text[0] == '\0') {
+        text = "----";
+    }
+
+    /* 1. Limpiar solo el panel (no todo el fondo) */
+    UI_ClearPanel();
+
+    /* 2. Dibujar borde */
+    Rect(PANEL_X, PANEL_Y, PANEL_W, PANEL_H, COL_FRAME);
+
+    /* 3. Calcular posición del texto centrado */
+    int fontSize = 2;  /* Tamaño ajustado para caber en panel de 110px */
+    int charW    = 6 * fontSize;
+    int charH    = 8 * fontSize;
+    int len      = strlen(text);
+    int textW    = len * charW;
+
+    int x = PANEL_X + (PANEL_W - textW) / 2;
+    if (x < (PANEL_X + 4)) x = PANEL_X + 4;
+
+    int y = PANEL_Y + (PANEL_H - charH) / 2;
+
+    /* 4. Imprimir texto */
+    LCD_Print((char*)text, x, y, fontSize, COL_FG, COL_PANEL);
+
+    /* Debug por UART */
+    char msg[100];
+    sprintf(msg, "[LCD] Panel actualizado: '%s' en (%d,%d)\r\n", text, x, y);
+    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 1000);
+}
+
+/* Inicializa la SD (solo para guardar, no para la imagen) */
+static void SD_Init(void)
+{
+    FRESULT res = f_mount(&USERFatFS, USERPath, 1);
+    char msg[80];
+
+    if (res == FR_OK) {
+        sd_mounted = 1;
+        sprintf(msg, "[SD] Montaje exitoso.\r\n");
+    } else {
+        sd_mounted = 0;
+        sprintf(msg, "[SD] Error al montar (FRESULT=%d).\r\n", res);
+    }
+    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 1000);
+}
+
+/* Guarda una línea en mediciones.txt */
+static void SD_AppendLine(const char *line)
+{
+    if (!sd_mounted || !line || line[0] == '\0') return;
+
+    FIL file;
+    FRESULT res = f_open(&file, "mediciones.txt", FA_OPEN_APPEND | FA_WRITE);
+    char msg[80];
+
+    if (res == FR_OK) {
+        UINT bw;
+        f_write(&file, line, (UINT)strlen(line), &bw);
+        f_close(&file);
+        sprintf(msg, "[SD] Guardado: %u bytes en mediciones.txt\r\n", (unsigned)bw);
+    } else {
+        sprintf(msg, "[SD] Error abriendo archivo (FRESULT=%d)\r\n", res);
+    }
+    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 1000);
+}
+
+/* USER CODE END 0 */
+
+int main(void)
+{
+  /* USER CODE BEGIN 1 */
+  char msgPC[250];
+  char msgESP[50];
+  /* USER CODE END 1 */
+
+  HAL_Init();
+  SystemClock_Config();
+
+  /* Initialize peripherals */
+  MX_GPIO_Init();
+  MX_SPI1_Init();
+  MX_USART2_UART_Init();
+  MX_FATFS_Init();
+  MX_TIM11_Init();
+  MX_USART3_UART_Init();
+
+  /* USER CODE BEGIN 2 */
+  HAL_Delay(500);
+
+  /* ========== INICIALIZACIÓN LCD ========== */
+  LCD_Init();
+
+  /* CRÍTICO: Dibujar fondo UNA SOLA VEZ */
+  UI_DrawBackground();
+
+  /* Panel inicial con "----" (en área blanca) */
+  UI_DrawSensorPanel("----");
+
+  /* Inicializar SD */
+  SD_Init();
+
+  /* Banner por UART */
+  sprintf(msgPC, "\r\n========================================\r\n");
+  HAL_UART_Transmit(&huart2, (uint8_t*)msgPC, strlen(msgPC), 1000);
+  sprintf(msgPC, " STM32F446RE - ILI9341 con fondo fijo\r\n");
+  HAL_UART_Transmit(&huart2, (uint8_t*)msgPC, strlen(msgPC), 1000);
+  sprintf(msgPC, "========================================\r\n");
+  HAL_UART_Transmit(&huart2, (uint8_t*)msgPC, strlen(msgPC), 1000);
+  sprintf(msgPC, "BTN (PC13): Solicitar lectura sensor\r\n");
+  HAL_UART_Transmit(&huart2, (uint8_t*)msgPC, strlen(msgPC), 1000);
+  sprintf(msgPC, "BTNSAVE (PB2): Guardar en SD + actualizar pantalla\r\n");
+  HAL_UART_Transmit(&huart2, (uint8_t*)msgPC, strlen(msgPC), 1000);
+  sprintf(msgPC, "========================================\r\n\r\n");
+  HAL_UART_Transmit(&huart2, (uint8_t*)msgPC, strlen(msgPC), 1000);
+
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* ===== BOTÓN USER: Leer sensor ===== */
+    if (HAL_GPIO_ReadPin(BTN_GPIO_Port, BTN_Pin) == GPIO_PIN_RESET && !btnPressed)
+    {
+      btnPressed = 1;
+      HAL_Delay(50);
+
+      if (HAL_GPIO_ReadPin(BTN_GPIO_Port, BTN_Pin) == GPIO_PIN_RESET)
+      {
+        sprintf(msgPC, "\r\n>>> SOLICITUD DE LECTURA <<<\r\n");
+        HAL_UART_Transmit(&huart2, (uint8_t*)msgPC, strlen(msgPC), 1000);
+
+        /* Enviar comando al ESP32 */
+        sprintf(msgESP, "SOLICITUD_SENSOR\r\n");
+        HAL_UART_Transmit(&huart3, (uint8_t*)msgESP, strlen(msgESP), 1000);
+
+        sprintf(msgPC, "[ESP32] Esperando respuesta...\r\n");
+        HAL_UART_Transmit(&huart2, (uint8_t*)msgPC, strlen(msgPC), 1000);
+
+        /* Recibir respuesta con timeout */
+        uint32_t startTime = HAL_GetTick();
+        uint32_t timeout   = 3000;
+        uint8_t  received  = 0;
+        uint16_t idx       = 0;
+
+        memset(rxBuffer, 0, sizeof(rxBuffer));
+
+        while ((HAL_GetTick() - startTime) < timeout && !received)
+        {
+          uint8_t ch;
+          if (HAL_UART_Receive(&huart3, &ch, 1, 100) == HAL_OK)
+          {
+            if (ch == '\n' || idx >= sizeof(rxBuffer) - 1) {
+              rxBuffer[idx] = '\0';
+              received = 1;
+            } else {
+              rxBuffer[idx++] = ch;
+            }
+          }
+        }
+
+        if (received)
+        {
+          sprintf(msgPC, "[ESP32] Recibido: %s\r\n", rxBuffer);
+          HAL_UART_Transmit(&huart2, (uint8_t*)msgPC, strlen(msgPC), 1000);
+
+          /* Parsear y guardar */
+          ParseSensorString((char*)rxBuffer, lastSensorStr, sizeof(lastSensorStr));
+          lastSensorValid = true;
+
+          /* ACTUALIZAR PANTALLA (solo el panel, no el fondo) */
+          UI_DrawSensorPanel(lastSensorStr);
+
+          sprintf(msgPC, "[LCD] Valor mostrado en pantalla.\r\n");
+          HAL_UART_Transmit(&huart2, (uint8_t*)msgPC, strlen(msgPC), 1000);
+        }
+        else
+        {
+          sprintf(msgPC, "[ERROR] Timeout - no hay respuesta del ESP32\r\n");
+          HAL_UART_Transmit(&huart2, (uint8_t*)msgPC, strlen(msgPC), 1000);
+          UI_DrawSensorPanel("TIMEOUT");
+        }
+
+        sprintf(msgPC, "========================================\r\n\r\n");
+        HAL_UART_Transmit(&huart2, (uint8_t*)msgPC, strlen(msgPC), 1000);
+      }
+    }
+
+    if (HAL_GPIO_ReadPin(BTN_GPIO_Port, BTN_Pin) == GPIO_PIN_SET) {
+      btnPressed = 0;
+    }
+
+    /* ===== BOTÓN SAVE: Guardar en SD y actualizar pantalla ===== */
+    if (HAL_GPIO_ReadPin(BTNSAVE_GPIO_Port, BTNSAVE_Pin) == GPIO_PIN_RESET && !btnSavePressed)
+    {
+      btnSavePressed = 1;
+      HAL_Delay(50);
+
+      if (HAL_GPIO_ReadPin(BTNSAVE_GPIO_Port, BTNSAVE_Pin) == GPIO_PIN_RESET)
+      {
+        if (lastSensorValid)
+        {
+          sprintf(msgPC, "\r\n[BTNSAVE] Guardando dato: %s\r\n", lastSensorStr);
+          HAL_UART_Transmit(&huart2, (uint8_t*)msgPC, strlen(msgPC), 1000);
+
+          /* Guardar en SD */
+          char line[260];
+          snprintf(line, sizeof(line), "%s\r\n", lastSensorStr);
+          SD_AppendLine(line);
+
+          /* ACTUALIZAR PANTALLA */
+          UI_DrawSensorPanel(lastSensorStr);
+
+          /* Notificar al ESP32 (cambio de color NeoPixel) */
+          char msgSave[] = "SAVE_SD\r\n";
+          HAL_UART_Transmit(&huart3, (uint8_t*)msgSave, strlen(msgSave), 1000);
+
+          sprintf(msgPC, "[BTNSAVE] Dato guardado y pantalla actualizada.\r\n");
+          HAL_UART_Transmit(&huart2, (uint8_t*)msgPC, strlen(msgPC), 1000);
+        }
+        else
+        {
+          sprintf(msgPC, "\r\n[BTNSAVE] No hay dato para guardar.\r\n");
+          HAL_UART_Transmit(&huart2, (uint8_t*)msgPC, strlen(msgPC), 1000);
+          UI_DrawSensorPanel("SIN DATO");
+        }
+      }
+    }
+
+    if (HAL_GPIO_ReadPin(BTNSAVE_GPIO_Port, BTNSAVE_Pin) == GPIO_PIN_SET) {
+      btnSavePressed = 0;
+    }
+
+    HAL_Delay(10);
+  }
+  /* USER CODE END WHILE */
+  /* USER CODE END 3 */
+}
+
+/* Las funciones de inicialización (SystemClock_Config, MX_GPIO_Init, etc.)
+ * permanecen SIN CAMBIOS - mantén tu código original aquí */
+
+// [Mantén todas las funciones MX_* y SystemClock_Config de tu código original]
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
+
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLM = 8;
+  RCC_OscInitStruct.PLL.PLLN = 80;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = 2;
+  RCC_OscInitStruct.PLL.PLLR = 2;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief SPI1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SPI1_Init(void)
+{
+
+  hspi1.Instance = SPI1;
+  hspi1.Init.Mode = SPI_MODE_MASTER;
+  hspi1.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi1.Init.NSS = SPI_NSS_SOFT;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_8;
+  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi1.Init.CRCPolynomial = 10;
+  if (HAL_SPI_Init(&hspi1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief TIM11 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM11_Init(void)
+{
+
+  htim11.Instance = TIM11;
+  htim11.Init.Prescaler = 0;
+  htim11.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim11.Init.Period = 999;
+  htim11.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim11.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim11) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+}
+
+/**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
+
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 9600;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+}
+
+/**
+  * @brief USART3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART3_UART_Init(void)
+{
+
+  huart3.Instance = USART3;
+  huart3.Init.BaudRate = 9600;
+  huart3.Init.WordLength = UART_WORDLENGTH_8B;
+  huart3.Init.StopBits = UART_STOPBITS_1;
+  huart3.Init.Parity = UART_PARITY_NONE;
+  huart3.Init.Mode = UART_MODE_TX_RX;
+  huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart3.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOH_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /* RST en HIGH (LCD listo) */
+  HAL_GPIO_WritePin(LCD_RST_GPIO_Port, LCD_RST_Pin, GPIO_PIN_SET);
+
+  /* Datos en A: D7, D0, D2 = 0 */
+  HAL_GPIO_WritePin(GPIOA, LCD_D7_Pin | LCD_D0_Pin | LCD_D2_Pin, GPIO_PIN_RESET);
+
+  /* WR y RD en HIGH (reposo) */
+  HAL_GPIO_WritePin(GPIOA, LCD_WR_Pin | LCD_RD_Pin, GPIO_PIN_SET);
+
+  /* RS en HIGH (modo datos por defecto) */
+  HAL_GPIO_WritePin(LCD_RS_GPIO_Port, LCD_RS_Pin, GPIO_PIN_SET);
+
+  /* CS de LCD y SS de SD en HIGH (no seleccionados) */
+  HAL_GPIO_WritePin(GPIOB, LCD_CS_Pin | SD_SS_Pin, GPIO_PIN_SET);
+
+  /* Datos en B: D6, D3, D5, D4 = 0 */
+  HAL_GPIO_WritePin(GPIOB, LCD_D6_Pin | LCD_D3_Pin | LCD_D5_Pin | LCD_D4_Pin, GPIO_PIN_RESET);
+
+  /* D1 en C = 0 */
+  HAL_GPIO_WritePin(LCD_D1_GPIO_Port, LCD_D1_Pin, GPIO_PIN_RESET);
+
+  /* BTN USER (PC13) */
+  GPIO_InitStruct.Pin = BTN_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(BTN_GPIO_Port, &GPIO_InitStruct);
+
+  /* LCD_RST (PC1) */
+  GPIO_InitStruct.Pin = LCD_RST_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_MEDIUM;
+  HAL_GPIO_Init(LCD_RST_GPIO_Port, &GPIO_InitStruct);
+
+  /* RD, WR, D7, D0, D2 (GPIOA) */
+  GPIO_InitStruct.Pin = LCD_RD_Pin | LCD_WR_Pin | LCD_D7_Pin | LCD_D0_Pin | LCD_D2_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /* RS (PA4) */
+  GPIO_InitStruct.Pin = LCD_RS_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_MEDIUM;
+  HAL_GPIO_Init(LCD_RS_GPIO_Port, &GPIO_InitStruct);
+
+  /* CS LCD + SS SD (PB0, PB6) */
+  GPIO_InitStruct.Pin = LCD_CS_Pin | SD_SS_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_MEDIUM;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /* BTNSAVE (PB2) */
+  GPIO_InitStruct.Pin = BTNSAVE_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(BTNSAVE_GPIO_Port, &GPIO_InitStruct);
+
+  /* D6, D3, D5, D4 (PB10, PB3, PB4, PB5) */
+  GPIO_InitStruct.Pin = LCD_D6_Pin | LCD_D3_Pin | LCD_D5_Pin | LCD_D4_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /* D1 (PC7) */
+  GPIO_InitStruct.Pin = LCD_D1_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(LCD_D1_GPIO_Port, &GPIO_InitStruct);
+}
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  __disable_irq();
+  while (1)
+  {
+  }
+}
+
+#ifdef USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line)
+{
+}
+#endif /* USE_FULL_ASSERT */
