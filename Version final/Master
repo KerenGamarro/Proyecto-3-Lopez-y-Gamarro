@@ -4,6 +4,24 @@
   * @file    main.c
   * @brief   STM32F446RE con ILI9341 - Fondo con dibujo + área de texto
   *          CORREGIDO: Botón BTNSAVE actualiza pantalla correctamente
+  *
+  * En este proyecto uso:
+  *  - STM32F446RE (Nucleo)
+  *  - Pantalla ILI9341 en modo paralelo 8 bits
+  *  - SD con FatFs para guardar mediciones
+  *  - Comunicación UART3 con un ESP32 que lee el sensor
+  *
+  * Flujo general que implemento:
+  *  - Dibujo una imagen de fondo a pantalla completa desde un bitmap en memoria.
+  *  - Reservo un panel (rectángulo blanco) en la parte derecha para mostrar el dato del sensor.
+  *  - Cuando presiono el botón BTN (PC13), le pido al ESP32 una lectura del sensor
+  *    por UART3 y guardo el último valor recibido solo en memoria.
+  *  - Cuando presiono BTNSAVE (PB2), si hay un dato válido:
+  *        -> lo guardo en la SD en el archivo "mediciones.txt"
+  *        -> actualizo el panel de la pantalla con ese valor
+  *        -> notifico al ESP32 con el comando "SAVE_SD" (por ejemplo para cambiar
+  *           el color de un NeoPixel).
+  *  - Todo el tiempo voy mandando mensajes por UART2 al PC para ir viendo qué pasa.
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -25,28 +43,35 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
-/* Dimensiones de la pantalla ILI9341 en modo landscape (horizontal) */
+/* Dimensiones de la pantalla ILI9341 en modo landscape (horizontal)
+ * Aquí defino el ancho (base) y alto de la pantalla según la configuración
+ * que uso en mi librería del ILI9341.
+ */
 #define LCD_W  320  /* Base (lado largo) */
 #define LCD_H  240  /* Altura (lado corto) */
 
-/* IMPORTANTE: Tu bitmap debe ser 320x240 para coincidir con la pantalla
- * Actualmente tienes un bitmap de 240x320 (vertical)
- * Opciones:
- * 1. Convertir la imagen a 320x240 (rotar 90° y ajustar)
- * 2. Cambiar la orientación de la pantalla a portrait en LCD_Init()
+/* Dimensiones del bitmap de fondo.
+ * NOTA: el bitmap debe estar alineado con la orientación de la pantalla.
+ * En mi caso, trabajo en 320x240 (horizontal).
  */
 #define FONDO_W 320
 #define FONDO_H 240
 
-/* Panel posicionado en el área BLANCA (lado derecho)
- * Ajusta PANEL_X según dónde termine el dibujo en tu imagen rotada
+/* Definición del panel donde voy a mostrar el dato del sensor.
+ * Este panel está sobre la "zona blanca" del fondo (lado derecho).
+ * PANEL_X, PANEL_Y son la esquina superior izquierda del cuadro.
+ * PANEL_W, PANEL_H son el tamaño del rectángulo donde va el texto.
  */
 #define PANEL_W   100    /* Ancho del panel de texto */
 #define PANEL_H   70     /* Alto del panel */
 #define PANEL_X   210    /* Posición X (área blanca derecha) */
-#define PANEL_Y   150    /* Posición Y (centrado verticalmente) */
+#define PANEL_Y   150    /* Posición Y (aprox centrado verticalmente) */
 
-/* Colores RGB565 */
+/* Colores RGB565 que uso en la pantalla:
+ *  - COL_FG: color del texto (negro)
+ *  - COL_PANEL: color de fondo del panel (blanco)
+ *  - COL_FRAME: color del borde del panel (negro)
+ */
 #define COL_FG     0x0000   /* Negro para texto */
 #define COL_PANEL  0xFFFF   /* Fondo del panel (blanco) */
 #define COL_FRAME  0x0000   /* Borde del panel (negro) */
@@ -61,21 +86,32 @@ UART_HandleTypeDef huart3;
 
 /* USER CODE BEGIN PV */
 
-/* Bitmap de fondo (debe ser 240x320x2 = 153,600 bytes) */
+/* Bitmap de fondo (debe ser 320x240x2 bytes).
+ * Lo declaro como extern porque el arreglo real está en otro archivo (bitmaps.c).
+ * Con "fondo" cargo la imagen principal que va a pantalla completa.
+ */
 extern const uint8_t BITMAP_ALIGN fondo[];
 
-/* Buffer de recepción UART */
+/* Buffer de recepción UART para guardar cadenas que vienen del ESP32. */
 uint8_t rxBuffer[200];
 
-/* Flags de botones */
+/* Flags simples para manejo de botones con antirrebote por software.
+ * - btnPressed: controla el botón de "SOLICITUD_SENSOR" (BTN, PC13).
+ * - btnSavePressed: controla el botón de guardado en SD + actualización de pantalla (BTNSAVE, PB2).
+ */
 uint8_t btnPressed     = 0;
 uint8_t btnSavePressed = 0;
 
-/* Último dato válido del sensor */
+/* Variables para manejar el último dato del sensor que recibo del ESP32.
+ * - lastSensorStr: aquí guardo la cadena ya "limpia" que quiero mostrar/guardar.
+ * - lastSensorValid: bandera que indica si efectivamente tengo un dato válido.
+ */
 static char   lastSensorStr[200] = {0};
 static bool   lastSensorValid    = false;
 
-/* SD / FatFs */
+/* Bandera para saber si la SD se montó correctamente.
+ * 0 = no montada, 1 = montada.
+ */
 static uint8_t sd_mounted = 0;
 
 /* USER CODE END PV */
@@ -89,6 +125,14 @@ static void MX_TIM11_Init(void);
 static void MX_USART3_UART_Init(void);
 
 /* USER CODE BEGIN PFP */
+/* Prototipos de mis funciones auxiliares de interfaz de usuario y SD.
+ * - UI_DrawBackground(): dibuja el fondo completo usando el bitmap.
+ * - UI_DrawSensorPanel(): dibuja el panel del sensor con el texto centrado.
+ * - UI_ClearPanel(): limpia solo el área del panel.
+ * - SD_Init(): monta la tarjeta SD mediante FatFs.
+ * - SD_AppendLine(): agrega una línea al archivo "mediciones.txt".
+ * - ParseSensorString(): procesa la cadena recibida del ESP32.
+ */
 static void UI_DrawBackground(void);
 static void UI_DrawSensorPanel(const char *text);
 static void UI_ClearPanel(void);
@@ -99,28 +143,59 @@ static void ParseSensorString(const char *src, char *dst, size_t dstSize);
 
 /* USER CODE BEGIN 0 */
 
-/* Parsea "LUX:123.45:OK" -> "LUX:123.45" */
+/**
+ * @brief   Parsea una cadena de sensor del estilo "LUX:123.45:OK"
+ *          y la recorta a "LUX:123.45" para mostrar/guardar algo más limpio.
+ *
+ * @param   src     Cadena original recibida del ESP32.
+ * @param   dst     Buffer de destino donde guardo la versión recortada.
+ * @param   dstSize Tamaño máximo del buffer de destino.
+ *
+ * Uso:
+ *  - Llamo a esta función en el while(1) después de recibir la respuesta del ESP32.
+ *  - La idea es quitar el campo extra (ejemplo "OK") y dejar solo "LUX:valor".
+ */
 static void ParseSensorString(const char *src, char *dst, size_t dstSize)
 {
     if (!src || !dst || dstSize == 0) return;
 
+    /* Copio la cadena origen a un buffer temporal para poder usar strtok
+     * sin modificar el original.
+     */
     char tmp[200];
     strncpy(tmp, src, sizeof(tmp) - 1);
     tmp[sizeof(tmp) - 1] = '\0';
 
-    char *token1 = strtok(tmp, ":");  // "LUX"
+    /* Separo la cadena por ":".
+     * token1 -> "LUX"
+     * token2 -> "123.45"
+     * (lo que venga después lo ignoro)
+     */
+    char *token1 = strtok(tmp, ":");   // "LUX"
     char *token2 = strtok(NULL, ":");  // "123.45"
 
     if (token1 && token2) {
+        /* Si tengo ambos tokens, formo "LUX:123.45". */
         snprintf(dst, dstSize, "%s:%s", token1, token2);
     } else {
+        /* Si no se pudo parsear bien, me quedo con la cadena original,
+         * pero cuidando de no desbordar el buffer.
+         */
         strncpy(dst, src, dstSize - 1);
         dst[dstSize - 1] = '\0';
     }
 }
 
-/* Dibuja el fondo COMPLETO desde el bitmap en memoria
- * SOLO SE LLAMA UNA VEZ en el setup
+/**
+ * @brief   Dibuja el fondo completo en la pantalla ILI9341.
+ *
+ * Esta función:
+ *  - Envía un mensaje por UART2 indicando que va a dibujar el fondo.
+ *  - Usa LCD_Bitmap(0,0,...) para pintar la imagen a pantalla completa.
+ *  - Luego manda otro mensaje indicando que ya terminó.
+ *
+ * Cuándo la llamo:
+ *  - Solo una vez en la etapa de inicialización (en main, después de LCD_Init).
  */
 static void UI_DrawBackground(void)
 {
@@ -129,20 +204,45 @@ static void UI_DrawBackground(void)
     sprintf(msg, "[LCD] Dibujando fondo %dx%d desde memoria...\r\n", FONDO_W, FONDO_H);
     HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 1000);
 
+    /* Dibujo el bitmap completo, alineado con el tamaño de pantalla. */
     LCD_Bitmap(0, 0, FONDO_W, FONDO_H, (unsigned char*)fondo);
 
     sprintf(msg, "[LCD] Fondo cargado.\r\n");
     HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 1000);
 }
 
-/* Limpia SOLO el área del panel (útil antes de redibujar) */
+/**
+ * @brief   Limpia solo el área del panel de texto.
+ *
+ * La idea es no borrar toda la pantalla (para no perder el fondo),
+ * sino únicamente el rectángulo donde voy a imprimir el valor del sensor.
+ *
+ * La llamo:
+ *  - Dentro de UI_DrawSensorPanel, justo antes de dibujar el nuevo texto,
+ *    para que no queden restos del valor anterior.
+ */
 static void UI_ClearPanel(void)
 {
     FillRect(PANEL_X, PANEL_Y, PANEL_W, PANEL_H, COL_PANEL);
 }
 
-/* Muestra el texto del sensor EN EL ÁREA BLANCA DERECHA
- * Sin tocar el resto de la pantalla
+/**
+ * @brief   Dibuja el panel del sensor y escribe el texto centrado dentro.
+ *
+ * @param   text  Cadena a mostrar. Si viene NULL o vacía, muestro "----".
+ *
+ * Flujo dentro de esta función:
+ *  1. Verifico que el texto sea válido; si no, uso "----".
+ *  2. Llamo a UI_ClearPanel() para limpiar el área rectangular.
+ *  3. Dibujo un borde (Rect) alrededor del panel.
+ *  4. Calculo la posición X,Y para centrar el texto en el panel usando el tamaño de fuente.
+ *  5. Llamo a LCD_Print() con color de texto negro y fondo blanco.
+ *  6. Mando un mensaje por UART2 indicando qué texto dibujé y en qué coordenadas.
+ *
+ * La llamo:
+ *  - Una vez al inicio para mostrar "----".
+ *  - Cada vez que presiono BTNSAVE y tengo un dato válido (actualizo el panel con la lectura).
+ *  - También si BTNSAVE se presiona sin dato, muestro "SIN DATO".
  */
 static void UI_DrawSensorPanel(const char *text)
 {
@@ -153,31 +253,43 @@ static void UI_DrawSensorPanel(const char *text)
     /* 1. Limpiar solo el panel (no todo el fondo) */
     UI_ClearPanel();
 
-    /* 2. Dibujar borde */
+    /* 2. Dibujar borde del panel. */
     Rect(PANEL_X, PANEL_Y, PANEL_W, PANEL_H, COL_FRAME);
 
-    /* 3. Calcular posición del texto centrado */
-    int fontSize = 2;  /* Tamaño ajustado para caber en panel de 110px */
+    /* 3. Calcular posición del texto centrado.
+     * Asumo una fuente base 6x8 píxeles, y la escalo por fontSize.
+     */
+    int fontSize = 2;  /* Tamaño ajustado para caber en panel de 100 px de ancho */
     int charW    = 6 * fontSize;
     int charH    = 8 * fontSize;
     int len      = strlen(text);
     int textW    = len * charW;
 
     int x = PANEL_X + (PANEL_W - textW) / 2;
-    if (x < (PANEL_X + 4)) x = PANEL_X + 4;
+    if (x < (PANEL_X + 4)) x = PANEL_X + 4;  /* Margen mínimo de 4 px a la izquierda */
 
     int y = PANEL_Y + (PANEL_H - charH) / 2;
 
-    /* 4. Imprimir texto */
+    /* 4. Imprimir texto en la pantalla. */
     LCD_Print((char*)text, x, y, fontSize, COL_FG, COL_PANEL);
 
-    /* Debug por UART */
+    /* 5. Debug por UART para verificar posición y contenido. */
     char msg[100];
     sprintf(msg, "[LCD] Panel actualizado: '%s' en (%d,%d)\r\n", text, x, y);
     HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 1000);
 }
 
-/* Inicializa la SD (solo para guardar, no para la imagen) */
+/**
+ * @brief   Inicializa/monta la tarjeta SD usando FatFs.
+ *
+ * Aquí uso:
+ *  - f_mount(&USERFatFS, USERPath, 1) para montar el sistema de archivos.
+ *  - Si todo sale bien, seteo sd_mounted = 1.
+ *  - Si hay error, sd_mounted = 0.
+ *
+ * La llamo:
+ *  - Una vez, en la etapa de inicialización dentro del main, después de MX_FATFS_Init().
+ */
 static void SD_Init(void)
 {
     FRESULT res = f_mount(&USERFatFS, USERPath, 1);
@@ -193,7 +305,22 @@ static void SD_Init(void)
     HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 1000);
 }
 
-/* Guarda una línea en mediciones.txt */
+/**
+ * @brief   Agrega una línea de texto al archivo "mediciones.txt" en la SD.
+ *
+ * @param   line  Cadena a guardar. Normalmente termina en "\r\n".
+ *
+ * Flujo:
+ *  - Primero reviso si la SD está montada y que la línea no sea vacía.
+ *  - Abro el archivo "mediciones.txt" en modo append (FA_OPEN_APPEND | FA_WRITE).
+ *  - Escribo la cadena completa.
+ *  - Cierro el archivo.
+ *  - Informo por UART cuántos bytes escribí o si hubo error.
+ *
+ * La llamo:
+ *  - Cuando presiono BTNSAVE y lastSensorValid == true. Antes de actualizar la pantalla,
+ *    guardo el valor en el archivo.
+ */
 static void SD_AppendLine(const char *line)
 {
     if (!sd_mounted || !line || line[0] == '\0') return;
@@ -218,14 +345,18 @@ static void SD_AppendLine(const char *line)
 int main(void)
 {
   /* USER CODE BEGIN 1 */
+  /* Buffers de texto que utilizo para mandar mensajes al PC (UART2)
+   * y comandos/strings al ESP32 (UART3).
+   */
   char msgPC[250];
   char msgESP[50];
   /* USER CODE END 1 */
 
+  /* Inicializo la HAL y el sistema de reloj principal. */
   HAL_Init();
   SystemClock_Config();
 
-  /* Initialize peripherals */
+  /* Inicialización de periféricos generados por CubeMX. */
   MX_GPIO_Init();
   MX_SPI1_Init();
   MX_USART2_UART_Init();
@@ -234,21 +365,23 @@ int main(void)
   MX_USART3_UART_Init();
 
   /* USER CODE BEGIN 2 */
+  /* Pequeña pausa para estabilidad inicial. */
   HAL_Delay(500);
 
   /* ========== INICIALIZACIÓN LCD ========== */
+  /* Inicializo la pantalla ILI9341 con mi librería. */
   LCD_Init();
 
-  /* CRÍTICO: Dibujar fondo UNA SOLA VEZ */
+  /* Dibujo el fondo UNA SOLA VEZ con la imagen completa. */
   UI_DrawBackground();
 
-  /* Panel inicial con "----" (en área blanca) */
+  /* Creo el panel inicial con "----" en la zona blanca de la derecha. */
   UI_DrawSensorPanel("----");
 
-  /* Inicializar SD */
+  /* Inicializo la SD para poder guardar medidas. */
   SD_Init();
 
-  /* Banner por UART */
+  /* Banner de bienvenida por UART2 (PC) para saber que todo arrancó bien. */
   sprintf(msgPC, "\r\n========================================\r\n");
   HAL_UART_Transmit(&huart2, (uint8_t*)msgPC, strlen(msgPC), 1000);
   sprintf(msgPC, " STM32F446RE - ILI9341 con fondo fijo\r\n");
@@ -268,52 +401,70 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    /* ===== BOTÓN USER (PC13): Leer sensor ===== */
+    /* ==========================================================
+     *  BLOQUE BOTÓN USER (BTN, PC13) -> SOLICITAR LECTURA AL ESP32
+     * ==========================================================
+     *
+     * Lógica:
+     *  - Detecto flanco de bajada (presionado) con la bandera btnPressed para antirrebote.
+     *  - Envío comando "SOLICITUD_SENSOR\r\n" por UART3 al ESP32.
+     *  - Espero la respuesta hasta un timeout de 3 segundos.
+     *  - Guardo lo recibido en rxBuffer, lo parseo con ParseSensorString
+     *    y actualizo lastSensorStr + lastSensorValid.
+     *  - NO actualizo la pantalla todavía, solo guardo el dato en memoria.
+     *    La pantalla solo se actualiza cuando presiono BTNSAVE.
+     */
     if (HAL_GPIO_ReadPin(BTN_GPIO_Port, BTN_Pin) == GPIO_PIN_RESET && !btnPressed)
     {
-      btnPressed = 1;
-      HAL_Delay(50);
+      btnPressed = 1;      /* Marco que ya procesé el presionado. */
+      HAL_Delay(50);       /* Antirrebote simple. */
 
       if (HAL_GPIO_ReadPin(BTN_GPIO_Port, BTN_Pin) == GPIO_PIN_RESET)
       {
         sprintf(msgPC, "\r\n>>> SOLICITUD DE LECTURA <<<\r\n");
         HAL_UART_Transmit(&huart2, (uint8_t*)msgPC, strlen(msgPC), 1000);
 
-        /* Enviar comando al ESP32 */
+        /* Enviar comando al ESP32 para que mida el sensor. */
         sprintf(msgESP, "SOLICITUD_SENSOR\r\n");
         HAL_UART_Transmit(&huart3, (uint8_t*)msgESP, strlen(msgESP), 1000);
 
         sprintf(msgPC, "[ESP32] Esperando respuesta...\r\n");
         HAL_UART_Transmit(&huart2, (uint8_t*)msgPC, strlen(msgPC), 1000);
 
-        /* Recibir respuesta con timeout */
+        /* Configuro variables para recibir la respuesta con timeout. */
         uint32_t startTime = HAL_GetTick();
-        uint32_t timeout   = 3000;
-        uint8_t  received  = 0;
-        uint16_t idx       = 0;
+        uint32_t timeout   = 3000;   /* 3 segundos de espera máxima. */
+        uint8_t  received  = 0;      /* Bandera para saber si ya llegó la línea. */
+        uint16_t idx       = 0;      /* Índice para llenar rxBuffer. */
 
         memset(rxBuffer, 0, sizeof(rxBuffer));
 
+        /* Bucle de recepción byte a byte hasta:
+         *  - encontrar '\n'
+         *  - llenar el buffer
+         *  - o llegar al timeout.
+         */
         while ((HAL_GetTick() - startTime) < timeout && !received)
         {
           uint8_t ch;
           if (HAL_UART_Receive(&huart3, &ch, 1, 100) == HAL_OK)
           {
             if (ch == '\n' || idx >= sizeof(rxBuffer) - 1) {
-              rxBuffer[idx] = '\0';
+              rxBuffer[idx] = '\0';   /* Termino la cadena. */
               received = 1;
             } else {
-              rxBuffer[idx++] = ch;
+              rxBuffer[idx++] = ch;   /* Acumulo caracteres. */
             }
           }
         }
 
         if (received)
         {
+          /* Muestro en la PC lo que llegó del ESP32. */
           sprintf(msgPC, "[ESP32] Recibido: %s\r\n", rxBuffer);
           HAL_UART_Transmit(&huart2, (uint8_t*)msgPC, strlen(msgPC), 1000);
 
-          /* Parsear y guardar SOLO EN MEMORIA (no actualiza pantalla) */
+          /* Parseo y guardo SOLO EN MEMORIA (no actualizo la pantalla aquí). */
           ParseSensorString((char*)rxBuffer, lastSensorStr, sizeof(lastSensorStr));
           lastSensorValid = true;
 
@@ -322,6 +473,7 @@ int main(void)
         }
         else
         {
+          /* Si no llegó nada a tiempo, reporto el error y marco que no hay dato válido. */
           sprintf(msgPC, "[ERROR] Timeout - no hay respuesta del ESP32\r\n");
           HAL_UART_Transmit(&huart2, (uint8_t*)msgPC, strlen(msgPC), 1000);
           lastSensorValid = false;
@@ -332,242 +484,23 @@ int main(void)
       }
     }
 
+    /* Cuando suelto el botón BTN, libero la bandera para poder leerlo de nuevo. */
     if (HAL_GPIO_ReadPin(BTN_GPIO_Port, BTN_Pin) == GPIO_PIN_SET) {
       btnPressed = 0;
     }
 
-    /* ===== BOTÓN SAVE (PB2): Guardar en SD y actualizar pantalla ===== */
-    if (HAL_GPIO_ReadPin(BTNSAVE_GPIO_Port, BTNSAVE_Pin) == GPIO_PIN_RESET && !btnSavePressed)
-    {
-      btnSavePressed = 1;
-      HAL_Delay(50);
-
-      if (HAL_GPIO_ReadPin(BTNSAVE_GPIO_Port, BTNSAVE_Pin) == GPIO_PIN_RESET)
-      {
-        if (lastSensorValid)
-        {
-          sprintf(msgPC, "\r\n[BTNSAVE] Guardando dato: %s\r\n", lastSensorStr);
-          HAL_UART_Transmit(&huart2, (uint8_t*)msgPC, strlen(msgPC), 1000);
-
-          /* 1. Guardar en SD */
-          char line[260];
-          snprintf(line, sizeof(line), "%s\r\n", lastSensorStr);
-          SD_AppendLine(line);
-
-          /* 2. ACTUALIZAR PANTALLA - Esta es la parte que faltaba */
-          UI_DrawSensorPanel(lastSensorStr);
-
-          /* 3. Notificar al ESP32 (cambio de color NeoPixel) */
-          char msgSave[] = "SAVE_SD\r\n";
-          HAL_UART_Transmit(&huart3, (uint8_t*)msgSave, strlen(msgSave), 1000);
-
-          sprintf(msgPC, "[BTNSAVE] Dato guardado y pantalla actualizada.\r\n");
-          HAL_UART_Transmit(&huart2, (uint8_t*)msgPC, strlen(msgPC), 1000);
-
-          sprintf(msgPC, "========================================\r\n\r\n");
-          HAL_UART_Transmit(&huart2, (uint8_t*)msgPC, strlen(msgPC), 1000);
-        }
-        else
-        {
-          sprintf(msgPC, "\r\n[BTNSAVE] No hay dato para guardar.\r\n");
-          HAL_UART_Transmit(&huart2, (uint8_t*)msgPC, strlen(msgPC), 1000);
-          UI_DrawSensorPanel("SIN DATO");
-
-          sprintf(msgPC, "========================================\r\n\r\n");
-          HAL_UART_Transmit(&huart2, (uint8_t*)msgPC, strlen(msgPC), 1000);
-        }
-      }
-    }
-
-    if (HAL_GPIO_ReadPin(BTNSAVE_GPIO_Port, BTNSAVE_Pin) == GPIO_PIN_SET) {
-      btnSavePressed = 0;
-    }
-
-    HAL_Delay(10);
-  }
-  /* USER CODE END WHILE */
-  /* USER CODE END 3 */
-}
-
-/* MANTÉN AQUÍ TODAS TUS FUNCIONES DE INICIALIZACIÓN ORIGINALES */
-/* SystemClock_Config, MX_GPIO_Init, MX_SPI1_Init, etc. */
-
-void SystemClock_Config(void)
-{
-  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
-
-  __HAL_RCC_PWR_CLK_ENABLE();
-  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
-
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
-  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
-  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
-  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
-  RCC_OscInitStruct.PLL.PLLM = 8;
-  RCC_OscInitStruct.PLL.PLLN = 80;
-  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
-  RCC_OscInitStruct.PLL.PLLQ = 2;
-  RCC_OscInitStruct.PLL.PLLR = 2;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
-  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
-
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-}
-
-static void MX_SPI1_Init(void)
-{
-  hspi1.Instance = SPI1;
-  hspi1.Init.Mode = SPI_MODE_MASTER;
-  hspi1.Init.Direction = SPI_DIRECTION_2LINES;
-  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
-  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
-  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
-  hspi1.Init.NSS = SPI_NSS_SOFT;
-  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_8;
-  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
-  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
-  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
-  hspi1.Init.CRCPolynomial = 10;
-  if (HAL_SPI_Init(&hspi1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-}
-
-static void MX_TIM11_Init(void)
-{
-  htim11.Instance = TIM11;
-  htim11.Init.Prescaler = 0;
-  htim11.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim11.Init.Period = 999;
-  htim11.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim11.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_Base_Init(&htim11) != HAL_OK)
-  {
-    Error_Handler();
-  }
-}
-
-static void MX_USART2_UART_Init(void)
-{
-  huart2.Instance = USART2;
-  huart2.Init.BaudRate = 9600;
-  huart2.Init.WordLength = UART_WORDLENGTH_8B;
-  huart2.Init.StopBits = UART_STOPBITS_1;
-  huart2.Init.Parity = UART_PARITY_NONE;
-  huart2.Init.Mode = UART_MODE_TX_RX;
-  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
-  if (HAL_UART_Init(&huart2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-}
-
-static void MX_USART3_UART_Init(void)
-{
-  huart3.Instance = USART3;
-  huart3.Init.BaudRate = 9600;
-  huart3.Init.WordLength = UART_WORDLENGTH_8B;
-  huart3.Init.StopBits = UART_STOPBITS_1;
-  huart3.Init.Parity = UART_PARITY_NONE;
-  huart3.Init.Mode = UART_MODE_TX_RX;
-  huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart3.Init.OverSampling = UART_OVERSAMPLING_16;
-  if (HAL_UART_Init(&huart3) != HAL_OK)
-  {
-    Error_Handler();
-  }
-}
-
-static void MX_GPIO_Init(void)
-{
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-
-  __HAL_RCC_GPIOC_CLK_ENABLE();
-  __HAL_RCC_GPIOH_CLK_ENABLE();
-  __HAL_RCC_GPIOA_CLK_ENABLE();
-  __HAL_RCC_GPIOB_CLK_ENABLE();
-
-  HAL_GPIO_WritePin(LCD_RST_GPIO_Port, LCD_RST_Pin, GPIO_PIN_SET);
-  HAL_GPIO_WritePin(GPIOA, LCD_D7_Pin | LCD_D0_Pin | LCD_D2_Pin, GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(GPIOA, LCD_WR_Pin | LCD_RD_Pin, GPIO_PIN_SET);
-  HAL_GPIO_WritePin(LCD_RS_GPIO_Port, LCD_RS_Pin, GPIO_PIN_SET);
-  HAL_GPIO_WritePin(GPIOB, LCD_CS_Pin | SD_SS_Pin, GPIO_PIN_SET);
-  HAL_GPIO_WritePin(GPIOB, LCD_D6_Pin | LCD_D3_Pin | LCD_D5_Pin | LCD_D4_Pin, GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(LCD_D1_GPIO_Port, LCD_D1_Pin, GPIO_PIN_RESET);
-
-  GPIO_InitStruct.Pin = BTN_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(BTN_GPIO_Port, &GPIO_InitStruct);
-
-  GPIO_InitStruct.Pin = LCD_RST_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_MEDIUM;
-  HAL_GPIO_Init(LCD_RST_GPIO_Port, &GPIO_InitStruct);
-
-  GPIO_InitStruct.Pin = LCD_RD_Pin | LCD_WR_Pin | LCD_D7_Pin | LCD_D0_Pin | LCD_D2_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
-  GPIO_InitStruct.Pin = LCD_RS_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_MEDIUM;
-  HAL_GPIO_Init(LCD_RS_GPIO_Port, &GPIO_InitStruct);
-
-  GPIO_InitStruct.Pin = LCD_CS_Pin | SD_SS_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_MEDIUM;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-  GPIO_InitStruct.Pin = BTNSAVE_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_PULLUP;
-  HAL_GPIO_Init(BTNSAVE_GPIO_Port, &GPIO_InitStruct);
-
-  GPIO_InitStruct.Pin = LCD_D6_Pin | LCD_D3_Pin | LCD_D5_Pin | LCD_D4_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-  GPIO_InitStruct.Pin = LCD_D1_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-  HAL_GPIO_Init(LCD_D1_GPIO_Port, &GPIO_InitStruct);
-}
-
-void Error_Handler(void)
-{
-  __disable_irq();
-  while (1)
-  {
-  }
-}
-
-#ifdef USE_FULL_ASSERT
-void assert_failed(uint8_t *file, uint32_t line)
-{
-}
-#endif
+    /* ==========================================================
+     *  BLOQUE BOTÓN BTNSAVE (PB2) -> GUARDAR EN SD Y ACTUALIZAR LCD
+     * ==========================================================
+     *
+     * Lógica:
+     *  - Detecto flanco de bajada con btnSavePressed (antirrebote).
+     *  - Si lastSensorValid == true:
+     *       1) agrego el valor a "mediciones.txt" en la SD.
+     *       2) actualizo el panel en la pantalla con ese valor.
+     *       3) notifico al ESP32 con "SAVE_SD\r\n" para que cambie
+     *          por ejemplo el color de un NeoPixel.
+     *  - Si NO hay dato válido, muestro "SIN DATO" en el panel y también
+     *    mando un mensaje por UART2.
+     */
+    if (HAL_GPIO_ReadPin(BTNSAVE_GPIO_Port, BTNSAVE_Pin) == GPIO_PIN_RESET && !btnSave_
