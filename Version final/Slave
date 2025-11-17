@@ -5,16 +5,16 @@
 #include <Adafruit_NeoPixel.h>
 
 /* ================== CONFIGURACIÓN HARDWARE ================== */
-// NeoPixel
+// Configuración del LED NeoPixel
 #define PIN_NEOPIXEL   23
 #define NUM_PIXELS     1
 
-// UART2 hacia STM32 (coincide con tu cableado)
+// Configuración del puerto UART2 para comunicarse con el STM32
 #define UART2_RX_PIN   32
 #define UART2_TX_PIN   33
 #define UART2_BAUD     9600
 
-// I2C para el sensor TSL2561 (solo ESP32 <-> sensor)
+// Pines del bus I2C para el sensor TSL2561
 #define I2C_SDA        25
 #define I2C_SCL        26
 
@@ -22,70 +22,87 @@
 #define LED_PIN        2
 
 /* ================== OBJETOS GLOBALES ================== */
+// Objeto del NeoPixel
 Adafruit_NeoPixel pixels(NUM_PIXELS, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
+
+// Objeto del sensor de luz TSL2561
 Adafruit_TSL2561_Unified tsl = Adafruit_TSL2561_Unified(TSL2561_ADDR_FLOAT, 12345);
 
 /* ================== VARIABLES ================== */
+// Guarda la última lectura de luz
 float lastLux  = 0;
+
+// Indica si el sensor fue configurado correctamente
 bool  sensorOK = false;
+
+// Variables para tiempos (mensajes y autolecturas)
 unsigned long lastHeartbeat = 0;
 unsigned long lastAutoRead  = 0;
+
+// Contador de comandos recibidos vía UART
 int   commandCounter        = 0;
 
 /* ================== FUNCIONES DE ESTADO (NEOPIXEL) ================== */
+/*
+   Estas funciones controlan el color del NeoPixel para mostrar
+   diferentes estados del sistema.
+*/
 
+// Cambia el color del LED NeoPixel (función base)
 void setPixelColor(uint8_t r, uint8_t g, uint8_t b)
 {
   pixels.setPixelColor(0, pixels.Color(r, g, b));
   pixels.show();
 }
 
-// ROJO -> sistema en reposo, sin botones
+// Estado ROJO → sistema en reposo
 void setStateIdle()
 {
-  setPixelColor(100, 0, 0);   // rojo
+  setPixelColor(100, 0, 0);
 }
 
-// AMARILLO -> se ha solicitado lectura de sensor
+// Estado AMARILLO → se recibió solicitud de lectura
 void setStateRequest()
 {
-  setPixelColor(100, 100, 0); // amarillo
+  setPixelColor(100, 100, 0);
 }
 
-// VERDE -> lectura recibida / operación OK
+// Estado VERDE → lectura realizada con éxito
 void setStateOK()
 {
-  setPixelColor(0, 100, 0);   // verde
+  setPixelColor(0, 100, 0);
 }
 
-// AZUL -> guardado en SD (solicitud de Nucleo)
+// Estado AZUL → comando de guardado (SAVE_SD)
 void setStateSave()
 {
-  setPixelColor(0, 0, 100);   // azul
+  setPixelColor(0, 0, 100);
 }
 
 /* ================== SENSOR TSL2561 ================== */
 
+// Inicializa el sensor TSL2561 (se llama en setup)
 void initSensor()
 {
   Serial.println("\n[SENSOR] Inicializando TSL2561...");
 
+  // Si no se detecta el sensor, marca error
   if (!tsl.begin()) {
-    Serial.println("[ERROR] No se detecta el sensor TSL2561!");
-    Serial.println("Verifica las conexiones:");
-    Serial.println("  SDA -> GPIO25");
-    Serial.println("  SCL -> GPIO26");
+    Serial.println("[ERROR] No se detecta el TSL2561!");
     sensorOK = false;
     return;
   }
 
+  // Si se detecta, configura el sensor
   sensorOK = true;
-  Serial.println("[OK] Sensor TSL2561 detectado.");
-  sensor_t sensor;
-  tsl.enableAutoRange(true);
-  tsl.setIntegrationTime(TSL2561_INTEGRATIONTIME_13MS);
-  tsl.getSensor(&sensor);
+  Serial.println("[OK] Sensor detectado.");
 
+  sensor_t sensor;
+  tsl.enableAutoRange(true);                     // Ajuste automático del rango
+  tsl.setIntegrationTime(TSL2561_INTEGRATIONTIME_13MS);  // Tiempo de integración
+  tsl.getSensor(&sensor);                        // Obtiene info técnica del sensor
+
+  // Imprime información del sensor
   Serial.println("------------------------------------");
   Serial.print("Sensor:       "); Serial.println(sensor.name);
   Serial.print("Driver Ver:   "); Serial.println(sensor.version);
@@ -96,6 +113,11 @@ void initSensor()
   Serial.println("------------------------------------\n");
 }
 
+/*
+   leerSensor() se usa tanto para:
+   - Autolectura en el loop (debug)
+   - Responder al STM32 cuando envía SOLICITUD_SENSOR
+*/
 String leerSensor()
 {
   if (!sensorOK) {
@@ -105,150 +127,131 @@ String leerSensor()
   sensors_event_t event;
   tsl.getEvent(&event);
 
+  // Si la lectura es válida
   if (event.light) {
     lastLux = event.light;
+
     String resultado = "LUX:";
     resultado += String(lastLux, 2);
     resultado += ":OK";
+
     return resultado;
-  } else {
-    return "ERROR_SENSOR_OVERFLOW";
   }
+
+  // Si la lectura se saturó
+  return "ERROR_SENSOR_OVERFLOW";
 }
 
 /* ================== SETUP ================== */
+/*
+   Aquí se inicializa todo:
+   - Serial USB
+   - NeoPixel
+   - I2C
+   - Sensor
+   - UART2
+   - Se fija el estado inicial (rojo)
+*/
 
 void setup()
 {
-  // Debug por USB
   Serial.begin(115200);
   delay(2000);
 
   Serial.println("\n\n========================================");
   Serial.println("          ESP32 - PROYECTO 3");
-  Serial.println("  Sensor TSL2561 (I2C) + UART con STM32");
   Serial.println("========================================");
 
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
 
-  // NeoPixel
-  Serial.println("[INIT] Inicializando NeoPixel...");
+  // Inicializa NeoPixel
   pixels.begin();
   pixels.setBrightness(50);
   pixels.clear();
   pixels.show();
 
-  // Pequeño test RGB (opcional)
+  // Pequeña animación de prueba
   setPixelColor(100, 0, 0); delay(200);
   setPixelColor(0, 100, 0); delay(200);
   setPixelColor(0, 0, 100); delay(200);
-  pixels.clear();
-  pixels.show();
+  pixels.clear(); pixels.show();
 
-  Serial.println("[OK] NeoPixel funcionando.\n");
-
-  // I2C solo para el sensor
-  Serial.println("[INIT] Inicializando I2C para el sensor...");
+  // Inicializar bus I2C
   Wire.begin(I2C_SDA, I2C_SCL);
-  Serial.print("  SDA: GPIO"); Serial.println(I2C_SDA);
-  Serial.print("  SCL: GPIO"); Serial.println(I2C_SCL);
+  initSensor();     // ← SE LLAMA A LA FUNCIÓN QUE CONFIGURA EL SENSOR
 
-  initSensor();
-
-  // UART2 hacia STM32
-  Serial.println("\n[INIT] Inicializando UART2 (ESP32 <-> STM32)...");
+  // Inicializar UART2 (comunicación con STM32)
   Serial2.begin(UART2_BAUD, SERIAL_8N1, UART2_RX_PIN, UART2_TX_PIN);
-  Serial.print("  RX: GPIO"); Serial.println(UART2_RX_PIN);
-  Serial.print("  TX: GPIO"); Serial.println(UART2_TX_PIN);
-  Serial.print("  Baud: ");     Serial.println(UART2_BAUD);
 
-  Serial.println("\n========================================");
-  Serial.println("Sistema listo.");
-  Serial.println("Esperando comando 'SOLICITUD_SENSOR' desde el STM32...");
-  Serial.println("========================================\n");
-
-  // Estado inicial: IDLE -> ROJO
+  // Estado inicial: IDLE (ROJO)
   setStateIdle();
 }
 
 /* ================== LOOP ================== */
+/*
+   El loop hace tres cosas principales:
+   1) Mandar un "heartbeat" por Serial USB cada 5 s
+   2) Hacer una lectura automática del sensor cada 10 s (debug)
+   3) Escuchar comandos desde el STM32 y responderles
+*/
 
 void loop()
 {
-  // Mensaje de vida por USB (solo debug)
+  // 1) Mensaje de vida por Serial
   if (millis() - lastHeartbeat > 5000) {
     lastHeartbeat = millis();
-    Serial.println("[HEARTBEAT] ESP32 activo, esperando comandos por UART2...");
+    Serial.println("[HEARTBEAT] ESP32 activo...");
   }
 
-  // Lectura automática por USB (solo debug local, no afecta a Nucleo)
+  // 2) Autolectura local cada 10 s (solo debug, no afecta al STM32)
   if (millis() - lastAutoRead > 10000) {
     lastAutoRead = millis();
-    String lecturaLocal = leerSensor();
-    Serial.print("[AUTO] Lectura local del sensor: ");
+    String lecturaLocal = leerSensor();   // ← SE LLAMA leerSensor()
+    Serial.print("[AUTO] Lectura local: ");
     Serial.println(lecturaLocal);
   }
 
-  // ======= COMANDOS DESDE STM32 POR UART2 =======
+  // 3) Escucha comandos enviados desde el STM32
   if (Serial2.available()) {
+
     String comando = Serial2.readStringUntil('\n');
     comando.trim();
+    commandCounter++;
 
-    if (comando.length() > 0) {
-      commandCounter++;
-      Serial.println("\n========================================");
-      Serial.print("[CMD #"); Serial.print(commandCounter);
-      Serial.println("] Comando recibido del STM32:");
-      Serial.print("Comando: ["); Serial.print(comando); Serial.println("]");
+    digitalWrite(LED_PIN, HIGH);
 
-      digitalWrite(LED_PIN, HIGH);  // Indicador interno
+    // Si el STM32 pide una lectura del sensor
+    if (comando.indexOf("SOLICITUD_SENSOR") >= 0) {
 
-      // 1) Solicitud de lectura de sensor
-      if (comando.indexOf("SOLICITUD_SENSOR") >= 0) {
+      setStateRequest();       // Amarillo
+      delay(100);
 
-        // Estado: solicitud -> AMARILLO
-        Serial.println("[ACCION] Solicitud de lectura de sensor.");
-        setStateRequest();
+      String valor = leerSensor();      // ← SE LLAMA leerSensor()
+      Serial2.println(valor);           // Respuesta al STM32
 
-        delay(100); // simula tiempo de lectura
-        String valor = leerSensor();
-
-        Serial.print("[RESPUESTA] Valor leido: ");
-        Serial.println(valor);
-
-        // Enviar respuesta al STM32
-        Serial2.println(valor);
-        Serial.println("[TX] Dato enviado al STM32.");
-
-        // Estado: lectura OK -> VERDE un momento, luego vuelve a ROJO
-        setStateOK();
-        delay(500);
-        setStateIdle();
-      }
-      // 2) Indicación de guardado en SD
-      else if (comando.indexOf("SAVE_SD") >= 0) {
-        Serial.println("[ACCION] Comando SAVE_SD recibido (guardado en SD).");
-
-        // Estado: GUARDAR -> AZUL, luego vuelve a ROJO
-        setStateSave();
-        delay(500);
-        setStateIdle();
-      }
-      // 3) Comandos opcionales de debug
-      else if (comando.indexOf("PING") >= 0) {
-        Serial.println("[ACCION] PING recibido.");
-        Serial2.println("PONG");
-        Serial.println("[TX] PONG enviado.");
-      }
-      else {
-        Serial.println("[WARNING] Comando no reconocido.");
-        Serial2.println("ERROR_CMD_UNKNOWN");
-      }
-
-      digitalWrite(LED_PIN, LOW);
-      Serial.println("========================================\n");
+      setStateOK();            // Verde
+      delay(500);
+      setStateIdle();          // Rojo
     }
+
+    // Si el STM32 indica que guardó en SD
+    else if (comando.indexOf("SAVE_SD") >= 0) {
+      setStateSave();          // Azul
+      delay(500);
+      setStateIdle();
+    }
+
+    // Comando PING (debug)
+    else if (comando.indexOf("PING") >= 0) {
+      Serial2.println("PONG");
+    }
+
+    else {
+      Serial2.println("ERROR_CMD_UNKNOWN");
+    }
+
+    digitalWrite(LED_PIN, LOW);
   }
 
   delay(10);
